@@ -1,0 +1,218 @@
+---
+title: "Discriminación de Cancer de Pulmón y Mesotelioma maligno pleural a partir de ratios de expresión génica"
+date: "20/6/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+#Introducción
+
+Con frecuencia, la distinción patológica entre mesotelioma pleural maligno (MPM) y adenocarcinoma (ADCA) de pulmón es una tarea complicada. El MPM es una enfermedad pulmonar altamente letal. Los pacientes que padecen MPM frecuentemente presentan efusión unilateral pleural o espesor pleural. Sin embargo, el ADCA es una causa más común en la efusión plural unilateral. El tratamiento más adecuado depende de un correcto diagnóstico.
+El objetivo de esta práctica será buscar una firma genética para distinguir entre MPM y ADCA de manera precisa. Para ello aplicaremos los conocimientos de minería de datos aprendidos durante el curso para analizar los datos de expresión génica proporcionados.
+
+#Metodología: Datos y algoritmos utilizados
+
+Los datos analizados provienen de 181 muestras de tejido (31 MPM y 150 ADCA). Cada muestra está descrita por 12533 variables. Cada variable corresponde a un gen concreto y su valor indica el grado de expresión de ese gen. El conjunto de datos viene dividido en 32 muestras de entrenamiento(16 MPM y 16 ADCA) y 149 muestras para test. Puesto que el método que vamos a utilizar para validar los modelos es cross-validation, uniremos los dos conjuntos iniciales en uno sólo.
+
+##Importación de los datos
+
+```{r, echo=TRUE, warning=FALSE}
+library(foreign)
+library(janitor)
+training <- read.arff('lungCancer_train.arff')
+test <- read.arff('lungCancer_test.arff')
+#Unimos los dos conjuntos en uno puesto que usaremos cross-validation para la validación interna
+datos <- rbind(training, test)
+#Limpiamos los nombres de las variables. Los nombres que presentan inicialmente las variables dan problemas a la hora de diseñar las fórmulas utilizadas en la estimación de los modelos. La función clean_names() hará las modificaciones necesarias para evitarnos problemas.
+datos <- clean_names(datos)
+```
+
+##Validación interna
+
+Predetendemos utilizar el procedimiento 10-fold cross validation. Puesto que usaremos el paquete 'caret', predefinimos una variable de tipo trainControl que no servirá para entrenar cualquier modelo más adelante. Además queremos que los modelos se evalúen en base a la métrica AUC, por tanto incluimos los parámetros necesarios.
+
+```{r echo=TRUE, warning=FALSE}
+library(caret)
+set.seed(7)
+control <- trainControl(method = 'cv', number = 10, classProbs = TRUE, summaryFunction = twoClassSummary)
+```
+
+##Filtrado de las variables
+
+Trabajar con el número inicial de varibles sería demasiado costoso computacionalmente. Es necesario por tanto realizar un filtrado para quedarnos con las variables que resulten más significativas.
+
+```{r echo=TRUE, warning=FALSE}
+library(FSelector)
+attr.scores <- chi.squared( class ~ ., datos)
+filtrado.primario <- cutoff.biggest.diff(attr.scores)
+```
+
+Tras realizar un primer filtrado nos quedamos con 4937 variables de las 12533 que teníamos inicialmente. Dada la gran cantidad de variables inicial hemos de utilizar un algortimo de filtrado que nos devuelva el resultado en un tiempo razonable. Utilizamos chi.squared dada su rapidez con respecto a los demás.
+
+```{r, echo=TRUE}
+attr.scores2 <- oneR( class ~ .,cbind( datos[,filtrado.primario], class=datos$class))
+filtrado.secundario <- cutoff.biggest.diff(attr.scores2)
+```
+
+Empleamos ahora el algoritmo OneR, muy usado en ensayos clínicos. Está basado en el algoritmo ID3, donde la meta principal consiste en adquirir las reglas de clasificación directamente desde el conjunto de datos de entrenamiento. Es simple y efectivo. Utiliza un único atributo para la clasificación, el cual es el de menor porciento de error y se obtiene un conjunto de reglas. Si existen atributos numéricos, busca los umbrales para hacer reglas con mejor tasa de aciertos.
+
+Después de un segundo filtrado nos quedan 14 variables. Ahora ya si es posible diseñar un algortimo para que seleccione las variables de nuestros modelos.
+
+##Implementación de Stepwise Forward Selection
+
+El método SFS realiza una búsqueda eficiente del mejor modelo. Requiere 4 parámetros de entrada:
+
+- algoritmo: 'nnet' para redes neuronales artificiales, 'glm' para regresión logística, 'rpart' para árboles de decisión, etc. Puede usarse cualquiera de los disponibles en el método train de 'caret'.
+- control: Objeto de tipo trainControl de caret. Lo hemos definido previamente en función del método de validación interna o la métrica. En nuestro caso 10-fold cross-validation y AUC.
+- variables: Conjunto de variables disponibles para generar los modelos. En nuestro caso utilizaremos las resultantes del segundo filtrado.
+- n: Número máximo de variables que permitimos que presente nuestro modelo.
+
+SFS actúa de la siguiente forma:
+
+- Se declara una fórmula inicial sin variables.
+- En la primera iteración busca el mejor modelos de entre todos los posibles
+con una variable utilizando las variables disponibles inicialmente. Para esta tarea hace uso de los métodos ComputeModels() y SearchBestModel() definidos más adelante.
+- La variable añadida se elimina del conjunto de variables disponiles y se añade a la fórmula inicial.
+- Se repite el procedimiento añadiendo variables al modelo hasta que añadir otra variable no mejore el AUC obtenido en generalización. 
+- Finalmente devuelve el mejor valor obtenido.
+
+```{r echo=TRUE, warning=FALSE}
+SFS <- function(algoritmo, control, datos, variables, n){
+  formula <- as.formula('class ~ 1')
+  aux.variables <- variables
+  bestAUC <- 0
+  best.fit <- NULL
+  i <- 1
+  while (i <= n){
+    set.seed(8)
+    New.fit <- SearchBestModel(ComputeModels(algoritmo = algoritmo, control = control, datos = datos, variables = aux.variables, formula.inicial = formula))
+    if(bestAUC >= max(New.fit$results$ROC)){
+      return(best.fit)
+    }else{
+      bestAUC <- max(New.fit$results$ROC)
+      best.fit <- New.fit
+      if(i > 1){  
+        var.added <- as.character(best.fit$terms[[3]][length(best.fit$terms[[3]])])
+      }else{
+        var.added <- as.character(best.fit$terms[[3]])
+      }
+      formula <- update(formula, as.formula(paste('~.+',var.added)))
+      aux.variables <- BorrarElemento(aux.variables, var.added)
+      i <- i + 1
+    }
+  }
+  return(best.fit)
+}
+```
+
+El método ComputeModels() devuelve una lista con todos los modelos posibles añadiendo una variable de entre las disponibles que se le pasan como parámetro a la formula inicial.
+
+```{r, echo=TRUE, warning=FALSE}
+library(pROC)
+ComputeModels <- function(algoritmo, control, datos, variables, formula.inicial){
+  res <- list()
+  for(v in var){
+    new.formula <- update(formula.inicial, as.formula(paste('~ . +',v)))
+    set.seed(8)
+    fit <- train(new.formula, datos, method = algoritmo, trControl = control, metric = 'ROC')
+    res <- c(res, list(fit))
+  }
+  return(res)
+}
+```
+
+El método SearchBestModel() busca el mejor modelo de una lista de modelos(obtenida mediante la función ComputeModels) en base al AUC en generalización.
+
+```{r echo=TRUE, warning=FALSE}
+SearchBestModel <- function(Models.list){
+  best.model <- Models.list[[1]]
+  for(model in Models.list){
+    if(max(model$results$ROC) > max(best.model$results$ROC)){
+      best.model <- model
+    }
+  }
+  return(best.model)
+}
+```
+
+```{r echo=FALSE, warning=FALSE}
+BorrarElemento <- function(vector, element){
+  i <- 1
+  while(i <= length(vector)){
+    if(vector[i]==element){
+      return(vector[-i])
+    }
+    i <- i+1
+  }
+}
+```
+
+#Resultados
+
+Aplicamos el método para redes neuronales artificiales, regresión logística, máquinas de soporte vectorial y árboles de decisión.
+
+```{r echo=FALSE, warning=FALSE}
+#Best.nnet.model <- SFS(algoritmo = 'nnet', control = control, datos = datos, variables = filtrado.secundario, 10)
+print(Best.nnet.model)
+print('Variables:')
+print(Best.nnet.model$terms[[3]])
+plot(Best.nnet.model)
+```
+
+```{r echo=FALSE, warning=FALSE}
+#Best.glm.model <- SFS(algoritmo = 'glm', control = control, datos = datos, variables = filtrado.secundario, 10)
+print(Best.glm.model)
+print('Variables:')
+print(Best.glm.model$terms[[3]])
+```
+
+```{r echo=FALSE, warning=FALSE}
+#Best.svm.model <- SFS(algoritmo = 'svmLinearWeights', control = control, datos = datos, variables = filtrado.secundario, 10)
+print(Best.svm.model)
+print('Variables:')
+print(Best.svm.model$terms[[3]])
+plot(Best.svm.model)
+```
+
+```{r echo=FALSE, warning=FALSE}
+#Best.DT.model <- SFS(algoritmo = 'rpart', control = control, datos = datos, variables = filtrado.secundario, 10)
+print(Best.DT.model)
+print('Variables:')
+print(Best.DT.model$terms[[3]])
+plot(Best.DT.model)
+```
+
+##Comparativa de los AUC obtenidos
+
+```{r echo=FALSE, warning=FALSE}
+AUCs <- c(max(Best.DT.model$results$ROC), max(Best.glm.model$results$ROC), max(Best.nnet.model$results$ROC), max(Best.svm.model$results$ROC))
+names(AUCs) = c('DT', 'Glm', 'Nnet', 'Svm')
+print(AUCs)
+```
+
+#Conclusiones
+
+Los AUC obtenidos son excelentes. Como era de esperar los árboles de decisión presentan el peor AUC en generalización y redes neuronales y máquinas de soporte vectorial el mejor. Pese a que el método de selección de variables es aproximativo, este devuelve resultados que si no son óptimos se encuentran muy cerca.
+Los modelos obtenidos con redes neuronales y svm son óptimos.
+
+Todos los modelos presentan la variable x37954_at por lo que puede decirse que la expresión de este gen es determinante en la distinción entre pacientes con MPM y ADCA. Los modelos construidos con svm y nnet presentan además la variable x1500_at lo que indica también la influencia de este gen.
+
+```{r echo=FALSE, warning=FALSE}
+ADCA <- subset(datos, class=='ADCA', select = c(x37954_at, x1500_at))
+MPM <- subset(datos, class=='Mesothelioma', select = c(x37954_at, x1500_at))
+print('ADCA')
+summary(ADCA)
+print('MPM')
+summary(MPM)
+boxplot(ADCA$x37954_at, MPM$x37954_at, names = c('ADCA', 'MPM'), col = 'blue', ylab= 'Grado', main = 'Expresión del gen x37954_at')
+boxplot(ADCA$x1500_at, MPM$x1500_at, names = c('ADCA', 'MPM'), col = 'blue',ylab= 'Grado',main = 'Expresión del gen x1500_at')
+```
+
+Si comparamos gráficamente el grado de expresión de los genes en ambos casos, podemos observar que tanto x37954_at como de x1500_at se expresan mucho más en el caso del mesotelioma. Esto confirma que ambos genes son un marcador relevante a la hora de distinguir entre pacientes con ADCA y pacientes con MPM.
+
+
+
